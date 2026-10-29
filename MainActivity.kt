@@ -1,42 +1,20 @@
 package com.example.stepbooster
 
-/*
- * ============================================================================
- * 1. build.gradle.kts (Module :app) me ye dependencies add karein:
- * ============================================================================
- * dependencies {
- *     implementation("androidx.health.connect:connect-client:1.1.0-alpha07")
- *     implementation("androidx.activity:activity-compose:1.8.2")
- *     implementation("androidx.compose.material3:material3:1.2.0")
- *     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.7.0")
- * }
- *
- * ============================================================================
- * 2. AndroidManifest.xml me ye Permissions aur Activity filter add karein:
- * ============================================================================
- * <uses-permission android:name="android.permission.health.READ_STEPS"/>
- * <uses-permission android:name="android.permission.health.WRITE_STEPS"/>
- *
- * <application ...>
- *     <activity android:name=".MainActivity" android:exported="true">
- *         <intent-filter>
- *             <action android:name="android.intent.action.MAIN" />
- *             <category android:name="android.intent.category.LAUNCHER" />
- *         </intent-filter>
- *
- *         <!-- Health Connect Permission Dialog ke liye zaroori intent-filter -->
- *         <intent-filter>
- *             <action android:name="androidx.health.ACTION_SHOW_PERMISSIONS_RATIONALE" />
- *         </intent-filter>
- *     </activity>
- * </application>
- *
- * <queries>
- *     <package android:name="com.google.android.apps.healthdata" />
- * </queries>
- */
-
+import android.annotation.SuppressLint
+import android.app.Notification
+import android.app.NotificationChannel
+import android.app.NotificationManager
+import android.app.PendingIntent
+import android.app.Service
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
+import android.os.IBinder
+import android.os.PowerManager
+import android.provider.Settings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
@@ -48,15 +26,14 @@ import androidx.compose.ui.Modifier
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.app.NotificationCompat
 import androidx.health.connect.client.HealthConnectClient
 import androidx.health.connect.client.PermissionController
 import androidx.health.connect.client.permission.HealthPermission
 import androidx.health.connect.client.records.StepsRecord
 import androidx.lifecycle.lifecycleScope
-import kotlinx.coroutines.Job
-import kotlinx.coroutines.delay
-import kotlinx.coroutines.isActive
-import kotlinx.coroutines.launch
+import kotlinx.coroutines.*
+import kotlinx.coroutines.flow.MutableStateFlow
 import java.time.Instant
 import java.time.ZoneId
 import java.time.temporal.ChronoUnit
@@ -65,9 +42,7 @@ import kotlin.random.Random
 class MainActivity : ComponentActivity() {
 
     private lateinit var healthConnectClient: HealthConnectClient
-    private var simulatorJob: Job? = null
 
-    // Health Connect permissions jo Google Fit me steps read/write karne ke liye chahiye
     private val permissions = setOf(
         HealthPermission.getReadPermission(StepsRecord::class),
         HealthPermission.getWritePermission(StepsRecord::class)
@@ -86,7 +61,6 @@ class MainActivity : ComponentActivity() {
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
 
-        // Check karein ki phone me Health Connect available hai ya nahi
         val availabilityStatus = HealthConnectClient.getSdkStatus(this)
         if (availabilityStatus == HealthConnectClient.SDK_AVAILABLE) {
             healthConnectClient = HealthConnectClient.getOrCreate(this)
@@ -106,10 +80,10 @@ class MainActivity : ComponentActivity() {
 
     @Composable
     fun StepSimulatorScreen() {
-        var isSimulating by remember { mutableStateOf(false) }
-        var totalInjectedSteps by remember { mutableLongStateOf(0L) }
-        var cadenceStepsPerMin by remember { mutableFloatStateOf(95f) } // Default: 95 steps/minute
-        var statusMessage by remember { mutableStateOf("Simulator Ready Hai") }
+        val isSimulating by StepForegroundService.isRunning.collectAsState()
+        val totalInjectedSteps by StepForegroundService.sessionSteps.collectAsState()
+        val statusMessage by StepForegroundService.statusText.collectAsState()
+        var cadenceStepsPerMin by remember { mutableFloatStateOf(95f) }
 
         Column(
             modifier = Modifier
@@ -119,8 +93,8 @@ class MainActivity : ComponentActivity() {
             verticalArrangement = Arrangement.Center
         ) {
             Text(
-                text = "Auto Step Simulator",
-                fontSize = 26.sp,
+                text = "Auto Step Simulator (24x7)",
+                fontSize = 24.sp,
                 fontWeight = FontWeight.Bold
             )
 
@@ -132,7 +106,7 @@ class MainActivity : ComponentActivity() {
                 color = MaterialTheme.colorScheme.primary
             )
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
             Card(
                 modifier = Modifier.fillMaxWidth(),
@@ -142,7 +116,7 @@ class MainActivity : ComponentActivity() {
                     modifier = Modifier.padding(20.dp),
                     horizontalAlignment = Alignment.CenterHorizontally
                 ) {
-                    Text(text = "Is Session me Badhaye Gaye Steps", fontSize = 14.sp)
+                    Text(text = "Background Session Steps", fontSize = 14.sp)
                     Text(
                         text = "$totalInjectedSteps",
                         fontSize = 42.sp,
@@ -152,9 +126,8 @@ class MainActivity : ComponentActivity() {
                 }
             }
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
-            // Walking Speed (Cadence) Slider
             Text(
                 text = "Walking Speed: ${cadenceStepsPerMin.toInt()} steps / minute",
                 fontWeight = FontWeight.Medium
@@ -166,32 +139,23 @@ class MainActivity : ComponentActivity() {
                 enabled = !isSimulating
             )
             Text(
-                text = "Tip: 80-110 steps/min sabse realistic natural walk lagti hai",
+                text = "Tip: 85-110 steps/min sabse natural walk lagti hai",
                 fontSize = 12.sp
             )
 
-            Spacer(modifier = Modifier.height(24.dp))
+            Spacer(modifier = Modifier.height(20.dp))
 
-            // Start / Stop Auto-Step Simulation Button
+            // Start / Stop Background Foreground Service Button
             Button(
                 onClick = {
                     if (!isSimulating) {
                         lifecycleScope.launch {
                             if (checkAndRequestPermissions()) {
-                                isSimulating = true
-                                statusMessage = "Running: Har 30 sec me steps Google Fit ko ja rahe hain..."
-                                startStepAlgorithm(
-                                    baseStepsPerMin = cadenceStepsPerMin.toInt(),
-                                    onStepsAdded = { added ->
-                                        totalInjectedSteps += added
-                                    }
-                                )
+                                startBackgroundStepService(cadenceStepsPerMin.toInt())
                             }
                         }
                     } else {
-                        stopStepAlgorithm()
-                        isSimulating = false
-                        statusMessage = "Simulator Paused"
+                        stopBackgroundStepService()
                     }
                 },
                 modifier = Modifier
@@ -199,100 +163,97 @@ class MainActivity : ComponentActivity() {
                     .height(54.dp)
             ) {
                 Text(
-                    text = if (isSimulating) "STOP AUTO STEPS" else "START AUTO STEPS",
-                    fontSize = 16.sp,
+                    text = if (isSimulating) "STOP BACKGROUND STEPS" else "START 24x7 BACKGROUND STEPS",
+                    fontSize = 15.sp,
                     fontWeight = FontWeight.Bold
                 )
             }
 
             Spacer(modifier = Modifier.height(12.dp))
 
-            // Instant +500 Steps Test Button
+            // Instant +500 Steps Button
             OutlinedButton(
                 onClick = {
                     lifecycleScope.launch {
                         if (checkAndRequestPermissions()) {
                             val now = Instant.now()
                             val start = now.minus(5, ChronoUnit.MINUTES)
-                            val success = writeStepsToHealthConnect(start, now, 500L)
+                            val success = writeInstantSteps(start, now, 500L)
                             if (success) {
-                                totalInjectedSteps += 500L
-                                statusMessage = "+500 Steps pichle 5 min ke window me add ho gaye!"
+                                StepForegroundService.sessionSteps.value += 500L
+                                StepForegroundService.statusText.value = "+500 Steps turant add ho gaye!"
                             }
                         }
                     }
                 },
                 modifier = Modifier.fillMaxWidth()
             ) {
-                Text(text = "Instant +500 Steps Add Karein (5 Min Walk)")
+                Text(text = "Instant +500 Steps Add Karein")
+            }
+
+            Spacer(modifier = Modifier.height(8.dp))
+
+            // Battery Optimization Bypass Button for Realme UI
+            TextButton(
+                onClick = { requestIgnoreBatteryOptimizations() },
+                modifier = Modifier.fillMaxWidth()
+            ) {
+                Text(text = "Realme Battery Saver Se App Ko Free Karein (1-Click)")
             }
         }
     }
 
-    /**
-     * NATURAL STEP SIMULATION ALGORITHM:
-     * Ek saath 10,000 steps dalne par Google Fit use unnatural (manual entry) maan sakta hai.
-     * Isliye yeh algorithm har 30 seconds ke interval par thode-thode random variation (jitter)
-     * ke saath steps insert karta hai, jisse lagta hai ki user sach me chal raha hai.
-     */
-    private fun startStepAlgorithm(
-        baseStepsPerMin: Int,
-        onStepsAdded: (Long) -> Unit
-    ) {
-        simulatorJob?.cancel()
-        simulatorJob = lifecycleScope.launch {
-            var batchStartTime = Instant.now()
+    private fun startBackgroundStepService(stepsPerMin: Int) {
+        val intent = Intent(this, StepForegroundService::class.java).apply {
+            action = StepForegroundService.ACTION_START
+            putExtra(StepForegroundService.EXTRA_CADENCE, stepsPerMin)
+        }
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            startForegroundService(intent)
+        } else {
+            startService(intent)
+        }
+    }
 
-            while (isActive) {
-                // 30 seconds wait karein (1 batch interval)
-                delay(30_000L)
+    private fun stopBackgroundStepService() {
+        val intent = Intent(this, StepForegroundService::class.java).apply {
+            action = StepForegroundService.ACTION_STOP
+        }
+        startService(intent)
+    }
 
-                val batchEndTime = Instant.now()
-
-                // 30 second me average steps + insaan ke chalne jaisa random variation (-4 se +5 steps)
-                val halfMinBase = baseStepsPerMin / 2
-                val naturalJitter = Random.nextInt(-4, 6)
-                val simulatedSteps = (halfMinBase + naturalJitter).coerceAtLeast(15).toLong()
-
-                val success = writeStepsToHealthConnect(
-                    startTime = batchStartTime,
-                    endTime = batchEndTime,
-                    stepCount = simulatedSteps
-                )
-
-                if (success) {
-                    onStepsAdded(simulatedSteps)
+    @SuppressLint("BatteryLife")
+    private fun requestIgnoreBatteryOptimizations() {
+        try {
+            val pm = getSystemService(Context.POWER_SERVICE) as PowerManager
+            if (!pm.isIgnoringBatteryOptimizations(packageName)) {
+                val intent = Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS).apply {
+                    data = Uri.parse("package:$packageName")
                 }
-
-                // Agle batch ka start time abhi ka end time hoga
-                batchStartTime = batchEndTime
+                startActivity(intent)
+            } else {
+                Toast.makeText(this, "Battery Saver pehle se OFF hai is app ke liye!", Toast.LENGTH_SHORT).show()
             }
+        } catch (e: Exception) {
+            Toast.makeText(this, "App Info > Battery Usage me jaakar Background Allow karein", Toast.LENGTH_LONG).show()
         }
     }
 
-    private fun stopStepAlgorithm() {
-        simulatorJob?.cancel()
-        simulatorJob = null
-    }
-
-    /**
-     * Health Connect me StepsRecord save karta hai, jise Google Fit auto-sync kar leta hai.
-     */
-    private suspend fun writeStepsToHealthConnect(
+    private suspend fun writeInstantSteps(
         startTime: Instant,
         endTime: Instant,
         stepCount: Long
     ): Boolean {
         return try {
             val zoneOffset = ZoneId.systemDefault().rules.getOffset(startTime)
-            val stepsRecord = StepsRecord(
+            val record = StepsRecord(
                 count = stepCount,
                 startTime = startTime,
                 startZoneOffset = zoneOffset,
                 endTime = endTime,
                 endZoneOffset = zoneOffset
             )
-            healthConnectClient.insertRecords(listOf(stepsRecord))
+            healthConnectClient.insertRecords(listOf(record))
             true
         } catch (e: Exception) {
             e.printStackTrace()
@@ -317,4 +278,175 @@ class MainActivity : ComponentActivity() {
             false
         }
     }
+}
+
+/**
+ * FOREGROUND SERVICE + WAKE LOCK:
+ * Yeh service phone ki screen lock hone ya app band karne ke baad bhi
+ * background me bina ruke har 30 second me steps Google Fit ko bhejti rehti hai.
+ */
+class StepForegroundService : Service() {
+
+    private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    private var simulatorJob: Job? = null
+    private var wakeLock: PowerManager.WakeLock? = null
+
+    companion object {
+        const val CHANNEL_ID = "step_booster_channel"
+        const val NOTIFICATION_ID = 1001
+        const val ACTION_START = "ACTION_START"
+        const val ACTION_STOP = "ACTION_STOP"
+        const val EXTRA_CADENCE = "EXTRA_CADENCE"
+
+        val isRunning = MutableStateFlow(false)
+        val sessionSteps = MutableStateFlow(0L)
+        val statusText = MutableStateFlow("Simulator Ready Hai")
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+        createNotificationChannel()
+    }
+
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        when (intent?.action) {
+            ACTION_START -> {
+                val cadence = intent.getIntExtra(EXTRA_CADENCE, 95)
+                startForegroundSimulation(cadence)
+            }
+            ACTION_STOP -> {
+                stopForegroundSimulation()
+            }
+        }
+        return START_STICKY
+    }
+
+    private fun startForegroundSimulation(baseStepsPerMin: Int) {
+        if (isRunning.value) return
+        isRunning.value = true
+        statusText.value = "Background Service Chalu Hai ($baseStepsPerMin steps/min)"
+
+        // WakeLock taaki screen band hone par Realme 6 CPU ko sleep me na bheje
+        val powerManager = getSystemService(Context.POWER_SERVICE) as PowerManager
+        wakeLock = powerManager.newWakeLock(
+            PowerManager.PARTIAL_WAKE_LOCK,
+            "StepBooster::StepWakeLock"
+        ).apply {
+            acquire(12 * 60 * 60 * 1000L) // Max 12 hours continuous lock
+        }
+
+        val notification = buildNotification(sessionSteps.value, baseStepsPerMin)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            startForeground(
+                NOTIFICATION_ID,
+                notification,
+                ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
+            )
+        } else {
+            startForeground(NOTIFICATION_ID, notification)
+        }
+
+        val healthClient = HealthConnectClient.getOrCreate(applicationContext)
+
+        simulatorJob?.cancel()
+        simulatorJob = serviceScope.launch {
+            var batchStartTime = Instant.now()
+
+            while (isActive && isRunning.value) {
+                delay(30_000L) // Har 30 second me 1 batch
+
+                val batchEndTime = Instant.now()
+                val halfMinBase = baseStepsPerMin / 2
+                val naturalJitter = Random.nextInt(-4, 6)
+                val simulatedSteps = (halfMinBase + naturalJitter).coerceAtLeast(15).toLong()
+
+                try {
+                    val zoneOffset = ZoneId.systemDefault().rules.getOffset(batchStartTime)
+                    val record = StepsRecord(
+                        count = simulatedSteps,
+                        startTime = batchStartTime,
+                        startZoneOffset = zoneOffset,
+                        endTime = batchEndTime,
+                        endZoneOffset = zoneOffset
+                    )
+                    healthClient.insertRecords(listOf(record))
+
+                    sessionSteps.value += simulatedSteps
+                    updateNotification(sessionSteps.value, baseStepsPerMin)
+                } catch (e: Exception) {
+                    e.printStackTrace()
+                }
+
+                batchStartTime = batchEndTime
+            }
+        }
+    }
+
+    private fun stopForegroundSimulation() {
+        isRunning.value = false
+        statusText.value = "Background Service Ruki Hui Hai"
+        simulatorJob?.cancel()
+        simulatorJob = null
+
+        try {
+            if (wakeLock?.isHeld == true) {
+                wakeLock?.release()
+            }
+        } catch (e: Exception) {
+            e.printStackTrace()
+        }
+
+        stopForeground(STOP_FOREGROUND_REMOVE)
+        stopSelf()
+    }
+
+    private fun buildNotification(currentSteps: Long, speed: Int): Notification {
+        val openAppIntent = Intent(this, MainActivity::class.java)
+        val openPendingIntent = PendingIntent.getActivity(
+            this, 0, openAppIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        val stopIntent = Intent(this, StepForegroundService::class.java).apply {
+            action = ACTION_STOP
+        }
+        val stopPendingIntent = PendingIntent.getService(
+            this, 1, stopIntent,
+            PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+        )
+
+        return NotificationCompat.Builder(this, CHANNEL_ID)
+            .setContentTitle("Step Booster Chalu Hai (+$currentSteps steps)")
+            .setContentText("Speed: $speed steps/min • Google Fit me sync ho raha hai")
+            .setSmallIcon(android.R.drawable.ic_menu_directions)
+            .setOngoing(true)
+            .setContentIntent(openPendingIntent)
+            .addAction(android.R.drawable.ic_media_pause, "STOP", stopPendingIntent)
+            .build()
+    }
+
+    private fun updateNotification(currentSteps: Long, speed: Int) {
+        val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        manager.notify(NOTIFICATION_ID, buildNotification(currentSteps, speed))
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            val channel = NotificationChannel(
+                CHANNEL_ID,
+                "Step Booster Background Service",
+                NotificationManager.IMPORTANCE_LOW
+            )
+            val manager = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            manager.createNotificationChannel(channel)
+        }
+    }
+
+    override fun onDestroy() {
+        stopForegroundSimulation()
+        serviceScope.cancel()
+        super.onDestroy()
+    }
+
+    override fun onBind(intent: Intent?): IBinder? = null
 }
